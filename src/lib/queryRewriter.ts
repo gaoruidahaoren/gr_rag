@@ -1,0 +1,346 @@
+// ============================================================
+// Query Rewriting：LLM 改写用户 query + 统一路由决策
+//
+// 策略：
+//   1. 优先用 LLM 改写 query + 同时输出路由决策（追问/路由/窗口/index章节）
+//   2. LLM 不可用时降级为本地硬编码规则（各模块保留正则作为 fallback）
+//   3. 一次 LLM 调用覆盖 queryRewriter + isFollowUp + smartRouter + adaptiveWindow + indexLookup
+// ============================================================
+
+import OpenAI from 'openai';
+import fs from 'fs';
+import path from 'path';
+
+// ============================================================
+// 类型定义
+// ============================================================
+
+/** 检索路由决策 */
+export type RouteDecision = 'structured' | 'semantic' | 'hybrid';
+
+/** 上下文窗口大小 */
+export type ContextWindow = 1 | 2 | 3;
+
+export interface RewrittenQuery {
+  /** 改写后的查询语句（用于向量/BM25 检索） */
+  rewritten: string;
+  /** 提取到的实体关键词列表（用于 SQLite 结构化查询） */
+  entities: string[];
+  /** 查询意图类型 */
+  intent: 'fact' | 'list' | 'compare' | 'summary' | 'analysis' | 'other';
+  /** 改写理由（用于调试） */
+  reason: string;
+}
+
+/**
+ * LLM 统一路由决策结果
+ * 一次 LLM 调用覆盖：追问检测、检索路由、上下文窗口、index 章节
+ */
+export interface LlmRouteDecision {
+  /** 是否为追问（指代上一轮内容或纠错） */
+  isFollowUp: boolean;
+  /** 检索路由：structured(查关联文档列表) / semantic(语义检索) / hybrid(混合) */
+  route: RouteDecision;
+  /** Small-to-Big 上下文窗口大小 */
+  contextWindow: ContextWindow;
+  /** index.md 命中的章节标题（如"客户列表"），无匹配时为 null */
+  indexSection: string | null;
+}
+
+// ============================================================
+// 实体关键词缓存（从 Wiki 目录加载，用于 prompt 和 fallback 校验）
+// ============================================================
+
+const WIKI_ROOT = path.join(process.cwd(), '..', 'Wiki');
+
+let knownEntitiesCache: string[] | null = null;
+
+/** 加载所有已知实体/概念名称 */
+function loadKnownEntities(): string[] {
+  if (knownEntitiesCache) return knownEntitiesCache;
+
+  const entities: string[] = [];
+  for (const sub of ['entity', 'concept']) {
+    const dir = path.join(WIKI_ROOT, sub);
+    if (!fs.existsSync(dir)) continue;
+    for (const file of fs.readdirSync(dir)) {
+      if (!file.endsWith('.md')) continue;
+      entities.push(file.replace(/\.md$/, ''));
+    }
+  }
+
+  knownEntitiesCache = [...new Set(entities)].sort((a, b) => b.length - a.length);
+  return knownEntitiesCache;
+}
+
+// ============================================================
+// LLM Query Rewriting
+// ============================================================
+
+/**
+ * 构建 LLM system prompt（动态注入已知实体列表作为参考 + 路由决策指令）
+ */
+function buildRewritePrompt(): string {
+  const knownEntities = loadKnownEntities();
+
+  // 按类别分组：人员、客户企业、技术组件、项目系统、部门、概念
+  const personEntities = knownEntities.filter(e => /^[\u4e00-\u9fff]{2,4}$/.test(e) && !/[司行团院部中心]/.test(e));
+  const clientEntities = knownEntities.filter(e => /银行|保险|集团|证券|钢铁|地产|置地|船舶|万科|碧桂园|龙湖|华润|中钢|宝武|国家电网|中国航发|招商|太平洋|中信/.test(e));
+  const techEntities = knownEntities.filter(e => /^[A-Z]/.test(e) || /系统|平台|服务|架构|框架|中间件|数据库/.test(e));
+  const deptEntities = knownEntities.filter(e => /部$|中心$|团队$/.test(e));
+
+  // 取代表性样本（避免 prompt 过长）
+  const sample = (arr: string[], max: number) => arr.slice(0, max).join('、');
+
+  return `你是一个知识库查询改写与路由助手。你的任务是：
+1. 改写用户的自然语言查询，使其更精准、更适合检索
+2. 从查询中提取结构化的实体关键词
+3. 判断查询的检索路由策略
+
+## 知识库包含的实体类型
+
+已知的部分实体（供参考，用户可能使用同义词或简称）：
+- 客户企业：${sample(clientEntities, 15)}
+- 技术组件：${sample(techEntities, 15)}
+- 人员：${sample(personEntities, 8)}
+- 部门：${sample(deptEntities, 8)}
+
+知识库的 index.md 包含以下章节可查询元信息：
+客户列表、文档类型、项目类型、概念索引、实体索引、客户企业、技术组件、项目系统、人员、部门、全部原始文档、知识库概览
+
+## 改写规则
+
+1. **补全隐含实体**：如果用户说"上次那个项目"，结合上下文补全为具体项目名
+2. **术语标准化**：将口语化表达转为标准术语（如"钱收回来没"→"回款金额"）
+3. **同义词展开**：将简称/别名展开为知识库中的标准名称
+4. **多实体拆分**：明确区分多个独立实体
+5. **保持简洁**：不要添加原始 query 中没有的信息，不要编造
+
+## 路由决策规则
+
+### isFollowUp（追问检测）
+判断当前 query 是否依赖上一轮对话才能理解。以下情况应为 true：
+- 包含指代词："那个"、"这个"、"它"、"他"、"她"、"这些"
+- 省略追问："那进度呢"、"那人呢"、"那成本呢"
+- 纠错/否定："不对，我说的是..."、"不是这个意思"、"重新查一下"
+- 确认反问："就这些？"、"没了吗？"
+- 展开/继续："详细说说"、"然后呢"、"还有呢"、"继续说"
+- 序号追问："第二个呢"、"第三个怎么样"
+- 比较追问："它和XX比呢"
+
+### route（检索路由）
+- structured：查询想获取某概念/实体关联的文档列表（如"有哪些文档"、"哪些项目用了"、"徐峰负责哪些"、"有没有ERP相关"）
+- semantic：查询想理解内容、获取答案、分析总结（如"微服务是什么"、"为什么选择这个架构"、"对比方案"）
+- hybrid：既需要文档列表又需要内容分析（如"哪些客户做了ERP，进展如何"）
+
+### contextWindow（上下文窗口）
+- 1（小窗口）：简单事实查询，一两句话能回答（如"负责人是谁"、"什么时候开始"）
+- 2（中窗口）：需要理解完整段落（如"架构设计原则"、"对比两个方案"、"流程是什么"）
+- 3（大窗口）：需要跨段落数据或表格信息（如"回款金额多少"、"统计各项目进度"、"具体费用明细"）
+
+### indexSection（index.md章节命中）
+如果用户明确在问知识库的元信息（如"有哪些客户"、"知识库有多少文档"），填入对应的章节名；否则为 null。
+可匹配的章节：客户列表、文档类型、项目类型、概念索引、实体索引、客户企业、技术组件、项目系统、人员、部门、全部原始文档、知识库概览
+
+## 输出格式
+
+严格输出一个 JSON 对象，不要有任何其他内容：
+
+{
+  "rewritten": "改写后的查询语句",
+  "entities": ["实体1", "实体2"],
+  "intent": "fact|list|compare|summary|analysis|other",
+  "isFollowUp": true或false,
+  "route": "structured|semantic|hybrid",
+  "contextWindow": 1或2或3,
+  "indexSection": "章节名或null",
+  "reason": "改写理由（中文，不超过20字）"
+}
+
+### intent 说明
+- fact: 查询具体事实/数值（如"徐峰负责什么"、"项目有多少人"）
+- list: 列举/统计（如"有哪些项目"、"多少家公司"）
+- compare: 对比分析（如"对比两个方案"）
+- summary: 总结概括（如"总结项目进展"）
+- analysis: 分析评估（如"为什么选择这个架构"）
+- other: 其他`;
+}
+
+/**
+ * LLM 改写 query 并提取实体
+ *
+ * @param query - 原始用户查询
+ * @param options - LLM 配置
+ * @returns 改写结果，失败时返回 null
+ */
+export async function rewriteQuery(
+  query: string,
+  options?: {
+    apiKey?: string;
+    baseURL?: string;
+    model?: string;
+    /** 对话历史中的上一轮 query（用于补全指代） */
+    previousQuery?: string;
+  }
+): Promise<RewrittenQuery | null> {
+  const apiKey = options?.apiKey || process.env.OPENAI_API_KEY || process.env.LLM_API_KEY || '';
+  const baseURL = options?.baseURL || process.env.OPENAI_BASE_URL || process.env.LLM_BASE_URL || '';
+  const model = options?.model || process.env.LLM_MODEL || 'gpt-3.5-turbo';
+
+  if (!apiKey) {
+    console.log('[QueryRewriter] 无 LLM API Key，跳过改写');
+    return null;
+  }
+
+  const systemPrompt = buildRewritePrompt();
+  const contextHint = options?.previousQuery
+    ? `\n对话历史：用户上一轮问了"${options.previousQuery}"`
+    : '';
+
+  const userPrompt = `用户查询: "${query}"${contextHint}
+
+请改写查询并提取实体，输出 JSON。`;
+
+  try {
+    const client = new OpenAI({ apiKey, baseURL: baseURL || undefined });
+    const response = await client.chat.completions.create({
+      model,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      temperature: 0,
+      max_tokens: 300,
+    });
+
+    const content = response.choices[0]?.message?.content || '';
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      console.warn('[QueryRewriter] LLM 返回格式异常:', content.slice(0, 200));
+      return null;
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]);
+
+    // 校验 entities 是否在已知列表中（不在的也保留，可能是同义词）
+    const knownSet = new Set(loadKnownEntities().map(e => e.toLowerCase()));
+    const validatedEntities: string[] = [];
+    const unknownEntities: string[] = [];
+
+    for (const e of (parsed.entities || [])) {
+      if (knownSet.has(e.toLowerCase())) {
+        validatedEntities.push(e);
+      } else {
+        unknownEntities.push(e);
+      }
+    }
+
+    // 未知实体也保留（可能是用户用的别名，SQLite 可能匹配到）
+    const allEntities = [...validatedEntities, ...unknownEntities];
+
+    // 解析路由决策字段
+    const route = ['structured', 'semantic', 'hybrid'].includes(parsed.route)
+      ? (parsed.route as RouteDecision)
+      : undefined;
+    const contextWindow = [1, 2, 3].includes(parsed.contextWindow)
+      ? (parsed.contextWindow as ContextWindow)
+      : undefined;
+    const indexSection = typeof parsed.indexSection === 'string' && parsed.indexSection.toLowerCase() !== 'null'
+      ? parsed.indexSection
+      : null;
+
+    const result: RewrittenQuery = {
+      rewritten: parsed.rewritten || query,
+      entities: allEntities,
+      intent: ['fact', 'list', 'compare', 'summary', 'analysis', 'other'].includes(parsed.intent)
+        ? parsed.intent
+        : 'other',
+      reason: parsed.reason || 'LLM 改写',
+    };
+
+    const routeResult: LlmRouteDecision = {
+      isFollowUp: parsed.isFollowUp === true,
+      route: route || 'semantic',
+      contextWindow: contextWindow || 2,
+      indexSection,
+    };
+
+    console.log(`[QueryRewriter] 改写: "${query}" → "${result.rewritten}"`);
+    console.log(`[QueryRewriter] 实体: [${result.entities.join(', ')}] (已知:${validatedEntities.length} 未知:${unknownEntities.length})`);
+    console.log(`[QueryRewriter] 意图: ${result.intent} | 理由: ${result.reason}`);
+    console.log(`[QueryRewriter] 路由: followUp=${routeResult.isFollowUp} route=${routeResult.route} window=${routeResult.contextWindow} indexSection=${routeResult.indexSection || '-'}`);
+
+    return { ...result, routeDecision: routeResult } as RewrittenQuery & { routeDecision: LlmRouteDecision };
+  } catch (err: any) {
+    console.warn(`[QueryRewriter] LLM 调用失败: ${err.message}`);
+    return null;
+  }
+}
+
+// ============================================================
+// 降级策略：jieba + 字典匹配（当 LLM 不可用时）
+// ============================================================
+
+/**
+ * 用 jieba 分词 + 字典匹配降级提取实体
+ * 直接复用 entityRouter 的 extractEntityKeywords
+ */
+export async function fallbackExtract(query: string): Promise<string[]> {
+  const { extractEntityKeywords } = await import('./entityRouter');
+  return extractEntityKeywords(query);
+}
+
+// ============================================================
+// 主入口：智能改写 + 实体提取
+// ============================================================
+
+/**
+ * 智能改写查询并提取实体 + 路由决策
+ *
+ * 流程：
+ *   1. 尝试 LLM 改写（返回 rewritten query + 结构化实体列表 + 路由决策）
+ *   2. LLM 失败时降级为 jieba + 字典匹配 + 本地硬编码规则
+ *   3. 返回改写后的 query、实体列表和路由决策
+ */
+export async function smartRewrite(
+  query: string,
+  options?: {
+    apiKey?: string;
+    baseURL?: string;
+    model?: string;
+    previousQuery?: string;
+  }
+): Promise<{
+  rewrittenQuery: string;
+  entities: string[];
+  intent: RewrittenQuery['intent'];
+  method: 'llm' | 'fallback';
+  /** LLM 路由决策（LLM 成功时有效，fallback 时为 null） */
+  routeDecision: LlmRouteDecision | null;
+}> {
+  // Step 1: 尝试 LLM 改写
+  const llmResult = await rewriteQuery(query, options);
+
+  if (llmResult) {
+    const withRoute = llmResult as RewrittenQuery & { routeDecision: LlmRouteDecision };
+    return {
+      rewrittenQuery: withRoute.rewritten,
+      entities: withRoute.entities,
+      intent: withRoute.intent,
+      method: 'llm',
+      routeDecision: withRoute.routeDecision || null,
+    };
+  }
+
+  // Step 2: LLM 不可用，降级为 jieba + 字典匹配 + 本地硬编码规则
+  console.log('[QueryRewriter] LLM 改写不可用，降级为 jieba + 字典匹配 + 本地硬编码路由');
+  const fallbackEntities = await fallbackExtract(query);
+
+  return {
+    rewrittenQuery: query, // 降级时不改写，保持原 query
+    entities: fallbackEntities,
+    intent: 'other',
+    method: 'fallback',
+    routeDecision: null, // null 表示需要 chat/route.ts 自行用硬编码判断
+  };
+}
