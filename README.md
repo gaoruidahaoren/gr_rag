@@ -7,7 +7,7 @@
 ```
 用户查询
     │
-    ├──→ 向量检索 (TF-IDF 384维, top20)
+    ├──→ 向量检索 (DashScope 1024维, top20)
     │
     ├──→ BM25 检索 (倒排索引, top20)
     │
@@ -77,12 +77,12 @@ llm-wiki/
 
 ## LLM 配置
 
-复制 `.env.example` 为 `.env.local`，配置 LLM API：
+复制 `.env` 为 `.env.local`，配置 LLM API：
 
 ```env
 OPENAI_API_KEY=sk-xxx
-OPENAI_BASE_URL=https://api.openai.com/v1
-LLM_MODEL=gpt-3.5-turbo
+OPENAI_BASE_URL=https://api.xiaomimimo.com/v1
+LLM_MODEL=mimo-v2.5
 ```
 
 也可以在 AI 问答页面的设置面板中直接配置。
@@ -92,7 +92,7 @@ LLM_MODEL=gpt-3.5-turbo
 ## 技术栈
 
 - **前端**: Next.js 16 + React 19 + Tailwind CSS 4
-- **分词**: 纯 JS 字典最大匹配分词
-- **向量**: 384维 TF-IDF 风格向量 + 余弦相似度
+- **分词**: @node-rs/jieba（结巴分词 Rust 实现，支持业务自定义词典）
+- **向量**: 1024维 DashScope `text-embedding-v4` + LanceDB IVF_PQ 索引 + 余弦相似度
 - **BM25**: 纯 JS 倒排索引实现
-- **LLM**: OpenAI 兼容 API（流式 SSE 输出）
+- **LLM**: 阿里云 DashScope API（兼容 OpenAI 格式，流式 SSE 输出）
