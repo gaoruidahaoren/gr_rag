@@ -79,8 +79,9 @@ spec/
 | 2 | [LLM 统一路由决策](implemented/002-llm-unified-routing.md) | ✅ implemented | queryRewriter, chat/route, ragEngine | 2026-06-09 |
 | 3 | 检索路径统一 (routedSearch) | 📋 planned | entityRouter, chat/route | 2026-06-08 |
 | 4 | 上下文窗口常量参数化 | 📋 planned | chat/route, hybridSearch | 2026-06-08 |
-| 5 | 硬编码路由规则覆盖增强 | 📋 planned | isFollowUpQuery, smartRouter, indexLookup, adaptiveWindow | 2026-06-08 |
+| 5 | 硬编码路由规则覆盖增强 | ✅ implemented → [003](implemented/003-smartrouter-cleanup-fallback.md) | isFollowUpQuery, smartRouter, indexLookup, adaptiveWindow | 2026-06-11 |
 | 6 | 实体提取缓存优化 | 📋 planned | queryRewriter, entityRouter | 2026-06-08 |
+| 7 | [smartRouter 死代码清理 + 正则降级合一](implemented/003-smartrouter-cleanup-fallback.md) | ✅ implemented | smartRouter, queryRewriter, structSearchEngine, chat/route | 2026-06-11 |
 
 ---
 
@@ -113,3 +114,4 @@ spec/
 - `AGENTS.md` — 开发治理规范（分支命名、测试要求、对账规则、完成定义）
 - `spec_20260608.md` — 遗留代码分析报告（项目全貌基线）
 - `spec_discussion_20260608.md` — 多套实现问题分析与重构讨论（6 大问题原始讨论）
+- `implemented/003-smartrouter-cleanup-fallback.md` — smartRouter 死代码清理 + 正则降级合一（2026-06-11）

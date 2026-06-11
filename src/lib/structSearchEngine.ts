@@ -266,3 +266,58 @@ export function closeStructDb(): void {
     _db = null;
   }
 }
+
+// ============================================================
+// 结构化查询执行 + 结果格式化（从 smartRouter 迁移）
+// ============================================================
+
+/**
+ * 执行结构化查询：根据匹配到的词条，从 SQLite 查出关联文档列表
+ */
+export async function executeStructuredQuery(
+  matchedEntries: string[],
+  mode: 'and' | 'or' = 'or'
+): Promise<StructSearchResult[]> {
+  if (!isStructDbReady()) {
+    console.warn('[StructSearch] 结构化数据库未就绪');
+    return [];
+  }
+
+  if (matchedEntries.length === 1) {
+    const result = queryByEntry(matchedEntries[0]);
+    return result ? [result] : [];
+  }
+
+  if (mode === 'and') {
+    return queryByEntriesAnd(matchedEntries);
+  }
+
+  return queryByEntriesOr(matchedEntries);
+}
+
+/**
+ * 将结构化查询结果转换为简洁的文档摘要文本（用于 LLM prompt）
+ */
+export function formatStructResults(results: StructSearchResult[]): string {
+  if (results.length === 0) return '';
+
+  const lines: string[] = [];
+
+  for (const r of results) {
+    const typeLabel = r.entry.type === 'concept' ? '概念' : '实体';
+    lines.push(`### ${typeLabel}「${r.entry.name}」(频次: ${r.entry.frequency})`);
+
+    if (r.documents.length === 0) {
+      lines.push('  (无关联文档)\n');
+      continue;
+    }
+
+    for (const doc of r.documents) {
+      const meta = [doc.client, doc.project, doc.docType].filter(Boolean).join(' | ');
+      lines.push(`  - ${doc.title} (${meta})`);
+    }
+    lines.push(`  共 ${r.documents.length} 篇关联文档\n`);
+  }
+
+  return lines.join('\n');
+}

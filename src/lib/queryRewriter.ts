@@ -278,6 +278,119 @@ export async function rewriteQuery(
 }
 
 // ============================================================
+// 降级策略：正则路由判断（LLM 不可用时）
+// ============================================================
+
+/**
+ * 结构化查询正则模式（LLM 降级策略）
+ * 迁移自 smartRouter.ts，补充 spec 分析中识别的高频遗漏模式
+ */
+const STRUCTURED_PATTERNS = [
+  /有哪些.*文档/,
+  /关联.*文档/,
+  /涉及.*(?:哪些|什么|多少).*文档/,
+  /列出.*(?:所有|全部).*文档/,
+  /.*相关的.*(?:所有|全部|哪些).*文档/,
+  /查.*文档列表/,
+  /.*的文档有哪些/,
+  /.*涉及了哪些/,
+  /哪些.*项目.*用到了/,
+  /哪些.*客户.*做/,
+  /.*在哪些.*中/,
+  /.*出现在.*哪些/,
+  /统计.*数量/,
+  /有多少.*文档/,
+  /有(?:哪|多少)(?:几?家|些|个)/,
+  /哪些.*(?:公司|项目|客户|部门|团队|系统|平台|产品|服务|应用)/,
+  /(?:公司|项目|客户|部门|团队).*用(?:了|过|到)/,
+  /(?:多少|几个).*(?:公司|项目|客户)/,
+  /(?:属于|归属).*(?:哪些|哪个|什么)/,
+  /(?:做了|在做|做过).*(?:哪些|什么)/,
+  /.*被.*(?:哪些|多少).*使用/,
+  /.*在.*哪些.*(?:公司|项目|客户)/,
+  // 补充：谁负责/谁在做类
+  /谁.*(?:负责|在做|参与)/,
+  /(?:负责|参与|做了).*(?:哪些|什么)/,
+  // 补充：有没有/是否存在类
+  /有没有.*(?:关于|相关|的).*(?:文档|资料)/,
+  /是否存在.*(?:相关|的).*(?:文档|资料)/,
+];
+
+/**
+ * 语义查询正则模式（LLM 降级策略）
+ * 迁移自 smartRouter.ts，补充 spec 分析中识别的高频遗漏模式
+ */
+const SEMANTIC_PATTERNS = [
+  /.*是(?:什么|谁|多少)/,
+  /怎么(?:做|实现|配置|部署)/,
+  /如何/,
+  /为什么/,
+  /对比|比较|区别|差异/,
+  /总结|归纳|概括/,
+  /分析|评估/,
+  /建议|推荐/,
+  /.*(?:好不好|行不行|可不可以)/,
+  /.*的意思/,
+  /解释/,
+  // 补充：介绍一下/讲一下类
+  /(?:介绍|讲讲|说说|讲一下|说一下).*/,
+];
+
+export interface FallbackRouteResult {
+  route: RouteDecision;
+  matchedEntries: string[];
+  reason: string;
+}
+
+/**
+ * 正则降级路由判断
+ * 当 LLM routeDecision 不可用时，用正则匹配作为降级策略
+ *
+ * @param query - 用户原始查询
+ * @param matchedEntries - 已匹配的实体列表
+ * @returns 路由决策结果
+ */
+export function fallbackRoute(query: string, matchedEntries: string[]): FallbackRouteResult {
+  // 无实体匹配时，走语义检索
+  if (matchedEntries.length === 0) {
+    // 检查是否为 index.md 元信息查询
+    // 注意：isIndexQuery 仍然在 indexLookup 中独立判断，这里不做重复
+    return {
+      route: 'semantic',
+      matchedEntries: [],
+      reason: '未匹配到任何已知概念/实体，降级为语义检索',
+    };
+  }
+
+  // 结构化模式优先检查
+  const isStructured = STRUCTURED_PATTERNS.some(p => p.test(query));
+  if (isStructured) {
+    return {
+      route: 'structured',
+      matchedEntries,
+      reason: `查询匹配结构化模式（文档列表/关联查询），匹配词条: [${matchedEntries.join(', ')}]`,
+    };
+  }
+
+  // 语义模式检查
+  const isSemantic = SEMANTIC_PATTERNS.some(p => p.test(query));
+  if (isSemantic) {
+    return {
+      route: 'semantic',
+      matchedEntries,
+      reason: '查询匹配语义分析模式（理解/解释/对比），降级为语义检索',
+    };
+  }
+
+  // 有实体但未命中任何模式 → 混合检索
+  return {
+    route: 'hybrid',
+    matchedEntries,
+    reason: `匹配到实体词条 [${matchedEntries.join(', ')}]，降级为混合检索（数据库+语义）`,
+  };
+}
+
+// ============================================================
 // 降级策略：jieba + 字典匹配（当 LLM 不可用时）
 // ============================================================
 

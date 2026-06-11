@@ -40,10 +40,13 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
-# lanceDB runtime artifacts
-src/data/lancedb/**/_transactions/
-src/data/lancedb/**/_indices/
-src/data/lancedb/**/_versions/
+# Generated index data (regeneratable)
+src/data/bm25/
+src/data/chunks_meta/
+src/data/vectors/
+src/data/parents/
+src/data/lancedb/
+src/data/struct_kb.db
 
 # SQLite runtime artifacts
 *.db-shm

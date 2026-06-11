@@ -4,7 +4,8 @@ import path from 'path';
 import { ragChatStream } from '@/lib/ragEngine';
 import { hybridSearch } from '@/lib/hybridSearch';
 import { isIndexReady } from '@/lib/indexManager';
-import { smartRewrite } from '@/lib/queryRewriter';
+import { smartRewrite, fallbackRoute } from '@/lib/queryRewriter';
+import { executeStructuredQuery, formatStructResults } from '@/lib/structSearchEngine';
 
 import type { SearchResult } from '@/lib/types';
 import { lookupIndexByQuery, isIndexQuery } from '@/lib/indexLookup';
@@ -72,6 +73,10 @@ export async function POST(req: NextRequest) {
         const isFollowUp = routeDecision
           ? routeDecision.isFollowUp
           : isFollowUpQuery(trimmedQuery); // fallback: 本地硬编码追问检测
+
+        // 路由降级：LLM 不可用时用正则匹配
+        const fallbackRouteResult = routeDecision ? null : fallbackRoute(trimmedQuery, matched);
+        const effectiveRoute = routeDecision?.route ?? fallbackRouteResult?.route ?? 'semantic';
 
         // 追问时补充上下文
         let enrichedQuery = trimmedQuery;
@@ -142,7 +147,9 @@ export async function POST(req: NextRequest) {
               sessionId: session.id,
               rewriteMethod: rewriteResult.method,
               rewrittenQuery: rewriteResult.method === 'llm' ? rewrittenQuery : undefined,
-              routeSource: routeDecision ? 'llm' : 'local',
+              routeSource: routeDecision ? 'llm' : 'regex-fallback',
+              route: effectiveRoute,
+              fallbackRouteReason: fallbackRouteResult?.reason,
             })}\n\n`
           )
         );
@@ -271,7 +278,6 @@ async function loadEntityDocsContent(
     return undefined;
   }
 
-  const { executeStructuredQuery, formatStructResults } = await import('@/lib/smartRouter');
   const structResults = await executeStructuredQuery(matchedKeywords, 'or');
   if (structResults.length === 0) {
     console.log(`[Chat] 结构化数据库未查到 [${matchedKeywords.join(', ')}] 的关联文档`);
